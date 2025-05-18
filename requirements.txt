@@ -10,4 +10,5 @@ supersuit==3.9.3
 torch
 torchrl
 numpy
-
+tensordict
+optuna
