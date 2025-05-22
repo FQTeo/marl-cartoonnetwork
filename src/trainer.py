@@ -1,4 +1,4 @@
-import random
+import os
 import json
 import optuna
 from collections import deque, namedtuple
@@ -30,6 +30,7 @@ from supersuit import frame_stack_v2, pad_observations_v0, pad_action_space_v0
 from functools import partial
 from tqdm import tqdm
 from til_environment.gridworld import env as raw_env
+from til_environment.types import RewardNames
 
 # ---------------- Classes ----------------
 
@@ -88,7 +89,13 @@ class ScoutGuardFlatten(nn.Module):
         d = obs["direction"].float()    # [B, A, 4]
         s = obs["scout"].float()        # [B, A, 2]
         l = obs["location"].float()     # [B, A, 2]
-
+        if l.ndim == 2:  # [B, 2] → [B, 1, 2]
+            l = l.unsqueeze(1)
+        
+        # print(f"flat_v: {flat_v.shape}")
+        # print(f"d: {d.shape}")
+        # print(f"s: {s.shape}")
+        # print(f"l: {l.shape}")
         # all 3-D, so this works:
         return torch.cat([flat_v, d, s, l], dim=-1)  # [B, A, 1128]
     
@@ -104,10 +111,32 @@ class ReshapeToMultiAgent(nn.Module):
 # ---------------- Methods ----------------
 
 def make_parallel_env():
+    rewards_dict = {
+        # Positive rewards
+        RewardNames.SCOUT_RECON: 1.0,         # Encourage collecting recon
+        RewardNames.SCOUT_MISSION: 5.0,      # Encourage completing mission
+        RewardNames.GUARD_CAPTURES: 60.0,     # Reward for capturing
+        RewardNames.GUARD_WINS: 30.0,         # Shared win reward for all guards
+
+        # Negative penalties
+        RewardNames.SCOUT_CAPTURED: -20.0,    # Big penalty for scout getting caught
+        RewardNames.WALL_COLLISION: -1.0,     # Discourage inefficient movement
+        RewardNames.AGENT_COLLIDER: -0.4,     # Discourage colliding with teammates
+        RewardNames.AGENT_COLLIDEE: -0.2,     # Minor penalty if collided into
+        RewardNames.STATIONARY_PENALTY: -0.3, # Discourage staying still
+
+        # Optional shaping to drive activity
+        RewardNames.GUARD_STEP: -0.005,        # Minor penalty per guard step (move with intent)
+        RewardNames.SCOUT_STEP: -0.01,        # Minor penalty per scout step (urgency)
+
+        # End-of-episode shaping
+        RewardNames.GUARD_TRUNCATION: -8.0,   # Penalize guards for failing to capture
+        RewardNames.SCOUT_TRUNCATION: -2.0,   # Penalize scout for not completing mission
+    }
     e = raw_env(env_wrappers = [
             PreserveDictWrapper,  # <--- YOUR CUSTOM WRAPPER
             partial(DictFrameStackWrapper, stack_size=4),
-        ], render_mode=None, novice=False)
+        ], render_mode=None, rewards_dict=rewards_dict, novice=False)
     e = wrappers.AssertOutOfBoundsWrapper(e)
     e = wrappers.OrderEnforcingWrapper(e)
     # e = frame_stack_v2(e, stack_size=4)
@@ -133,7 +162,16 @@ def test_env(env):
 def unpack_bits(x):
     return ((x.unsqueeze(-1) >> torch.arange(8)) & 1).float()
 
-def make_policy(n_agents): # Shared MLP wrapper
+def generate_dummy_observation():
+    dummy_obs = {
+        "viewcone": torch.zeros((1, 1, 7, 5, 4), dtype=torch.uint8),   # [B, A, 7, 5, 4]
+        "direction": torch.nn.functional.one_hot(torch.zeros((1, 1), dtype=torch.long), num_classes=4).float(),  # [B, A, 4]
+        "scout": torch.nn.functional.one_hot(torch.zeros((1, 1), dtype=torch.long), num_classes=2).float(),      # [B, A, 2]
+        "location": torch.zeros((1, 1, 2), dtype=torch.float32)  # [B, A, 2]
+    }
+    return dummy_obs
+
+def make_policy(n_agents, n_features, device, num_cells, activation_class): # Shared MLP wrapper
     return MultiAgentMLP(
         n_agent_inputs=n_features,
         n_agent_outputs=5,
@@ -143,7 +181,7 @@ def make_policy(n_agents): # Shared MLP wrapper
         device=device,
         depth=2,
         num_cells=num_cells,
-        activation_class=nn.Tanh,
+        activation_class=activation_class,
     )
 
 def test_agents():
@@ -196,22 +234,21 @@ def process_batch(batch: TensorDictBase, groups: dict) -> TensorDictBase:
     return batch
 
 def setup_models(params, env, device):
-    # print("env.observation_spec['scout', 'observation']:", env.observation_spec.get(("scout", "observation")))
-    # n_scouts = env.observation_spec["scout", "observation"].shape[1]
-    # n_guards = env.observation_spec["guard", "observation"].shape[1]
-    # n_entities = env.observation_spec["scout", "observation"].shape[2]
-    # n_features = env.observation_spec["guard", "observation"].shape[3]
     n_scouts = 1
     n_guards = 3
-    n_features = 1128
+    flatten = ScoutGuardFlatten()
+    with torch.no_grad():
+        flat_output = flatten(TensorDict(generate_dummy_observation(), batch_size=[1]))
+        n_features = flat_output.shape[-1]
+    print(f"n_features: {n_features}")
 
     # Create activation function
     if params["activation"] == "Tanh":
-        activation_class = torch.nn.Tanh
+        activation_class = nn.Tanh
     elif params["activation"] == "ReLU":
-        activation_class = torch.nn.ReLU
+        activation_class = nn.ReLU
     else:
-        activation_class = torch.nn.Tanh  # Default
+        activation_class = nn.Tanh  # Default
 
     policy_modules = {}
 
@@ -221,7 +258,7 @@ def setup_models(params, env, device):
             module=nn.Sequential(
                 ScoutGuardFlatten(),        # takes one obs dict, outputs [B, 284]
                 # ReshapeToMultiAgent(num_agents, n_features),
-                make_policy(num_agents),      # returns [B, 5]
+                make_policy(num_agents, n_features, device, params["network_width"], activation_class),      # returns [B, 5]
                 nn.Softmax(dim=-1),
             ),
             in_keys=[(group, "observation")],       # use group name here
@@ -259,8 +296,6 @@ def setup_models(params, env, device):
                 centralised=True,       
                 share_params=True,
                 device=device,
-                # depth=2,
-                # num_cells=num_cells,
                 activation_class=activation_class,
                 depth=params["network_depth"],
                 num_cells=params["network_width"],
@@ -454,7 +489,7 @@ def objective(trial):
     params = {
         # Sampling parameters
         "n_parallel_envs": 8,
-        "frames_per_batch": 2000,  # Fixed for consistency
+        "frames_per_batch": 1000,  # Fixed for consistency
         "total_frames": 20000,  # Reduced for faster trials
 
         # Training parameters
@@ -465,13 +500,13 @@ def objective(trial):
 
         # PPO parameters
         "clip_epsilon": trial.suggest_float("clip_epsilon", 0.1, 0.3),
-        "gamma": trial.suggest_float("gamma", 0.95, 0.999),
-        "lmbda": trial.suggest_float("lmbda", 0.9, 1.0),
-        "entropy_coef": trial.suggest_float("entropy_coef", 1e-5, 1e-3, log=True),
+        "gamma": trial.suggest_float("gamma", 0.99, 0.999),
+        "lmbda": trial.suggest_float("lmbda", 0.95, 1.0),
+        "entropy_coef": trial.suggest_float("entropy_coef", 3e-4, 1e-3, log=True),
 
         # Network parameters
         "network_depth": trial.suggest_int("network_depth", 1, 3),
-        "network_width": trial.suggest_categorical("network_width", [64, 128, 256, 512]),
+        "network_width": trial.suggest_categorical("network_width", [64, 128, 256, 512, 1128]),
         "activation": trial.suggest_categorical("activation", ["Tanh", "ReLU"]),
         "share_parameters_policy": True,  # Fixed for simplicity
         "share_parameters_critic": True,  # Fixed for simplicity
@@ -494,14 +529,10 @@ def objective(trial):
     return mean_reward
 
 if __name__ == "__main__":
-    # freeze_support()
     # ---------------- Environment Wrapping ----------------
-    n_scouts = 1
-    n_guards = 3
-    n_agents = 4
-    n_features = 1128
-    num_cells = 256
     n_parallel_envs = 8
+    frames_per_batch=5000
+    total_frames=20000
     e = make_parallel_env()
     group_map = {
         "scout": ["player_0"],
@@ -529,67 +560,12 @@ if __name__ == "__main__":
     env = ParallelEnv(n_parallel_envs, make_env, serial_for_single=True, device=device)
     # test_env(env)
 
-    # ---------------- Parameters ----------------
+    # ---------------- Hyperparameter Tuning & Training ----------------
 
-    
-    #Parameters for Env
-    # n_parallel_envs = 8  
-    # frames_per_batch = 8000  # Number of team frames collected per training iteration
-    # total_frames = 2000000
-    # num_epochs = 5  # Number of optimization steps per training iteration
-    # minibatch_size = 1024  # Size of the mini-batches in each optimization step
-    # lr = 3e-3  # Learning rate
-    # max_grad_norm = 1.0  # Maximum norm for the gradients
-    # clip_epsilon = 0.2  # clip value for PPO loss
-    # gamma = 0.99  # discount factor
-    # lmbda = 0.95  # lambda for generalised advantage estimation
-    # entropy_coef = 1e-4  # coefficient of the entropy term in the PPO loss
-    # value_loss_coef = 0.5        # Relative weight of value loss vs policy loss
-    # normalize_advantage = True
-    # use_gae = True
-    # n_parallel_envs = 8 #2  
-    # frames_per_batch = 1024 #64  # Number of team frames collected per training iteration
-    # total_frames = 20000 #128
-    # num_epochs = 5 #1  # Number of optimization steps per training iteration
-    # minibatch_size = 256 #32  # Size of the mini-batches in each optimization step
-    # lr = 3e-3  # Learning rate
-    # max_grad_norm = 1.0  # Maximum norm for the gradients
-    # clip_epsilon = 0.2  # clip value for PPO loss
-    # gamma = 0.99  # discount factor
-    # lmbda = 0.95  # lambda for generalised advantage estimation
-    # entropy_coef = 1e-4  # coefficient of the entropy term in the PPO loss
-    # value_loss_coef = 0.5        # Relative weight of value loss vs policy loss
-    # normalize_advantage = True
-    # use_gae = True  
     set_composite_lp_aggregate(False).set()
-
-    default_params = {
-
-        # Sampling parameters
-        "n_parallel_envs": 8,
-        "frames_per_batch": 2000,  # Number of frames collected per training iteration
-        "total_frames": 200000,  # Total frames for training
-        # Training parameters
-        "num_epochs": 5,  # Number of optimization steps per training iteration
-        "minibatch_size": 400,  # Size of the mini-batches in each optimization step
-        "lr": 3e-4,  # Learning rate
-        "max_grad_norm": 1.0,  # Maximum norm for the gradients
-        # PPO parameters
-        "clip_epsilon": 0.2,  # Clip value for PPO loss
-        "gamma": 0.99,  # Discount factor
-        "lmbda": 0.9,  # Lambda for generalized advantage estimation
-        "entropy_coef": 1e-4,  # Coefficient of the entropy term in the PPO loss
-        # Network parameters
-        "network_depth": 2,  # Depth of the neural networks
-        "network_width": 256,  # Width of the neural networks
-        "activation": "Tanh",  # Activation function
-        "share_parameters_policy": True,  # Whether to share parameters in policy
-        "share_parameters_critic": True,  # Whether to share parameters in critic
-        "mappo": True,  # Whether to use MAPPO (True) or IPPO (False)
-    }
     
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=2)  # Adjust based on computational resources (n = 2 is very small)
+    study.optimize(objective, n_trials=1)  # Adjust based on computational resources (min. 20, n=2 is very small)
 
     # Print best parameters
     print("Best trial:")
@@ -607,9 +583,9 @@ if __name__ == "__main__":
     best_params = {
 
         # Sampling parameters (use full budget for final training)
-        "n_parallel_envs": 8,
-        "frames_per_batch": 2000,
-        "total_frames": 200000,  # Full training budget
+        "n_parallel_envs": n_parallel_envs,
+        "frames_per_batch": frames_per_batch,
+        "total_frames": total_frames,  # Full training budget
 
         # Other parameters from best trial
         "num_epochs": study.best_params["num_epochs"],
@@ -667,12 +643,20 @@ if __name__ == "__main__":
     # plt.show()
 
 
-    # -------------------- Critics -------------------------------
+    # -------------------- Save Models -------------------------------
 
     # test_agents()
     # test_env_rollout()
     # obs = env.reset()
     # print(obs["scout", "observation"])
     
-    print("the end")
+    print("Training complete. Saving models...")
+    save_dir = "models"
+    os.makedirs(save_dir, exist_ok=True)
+
+    torch.save(policies["scout_actor"].state_dict(), os.path.join(save_dir, "scout_actor.pth"))
+    torch.save(policies["guard_actor"].state_dict(), os.path.join(save_dir, "guard_actor.pth"))
+
+    print(f"Models saved to: {os.path.abspath(save_dir)}")
+    print("Models saved. Goodbye.")
     
