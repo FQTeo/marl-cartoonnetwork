@@ -172,7 +172,15 @@ def generate_dummy_observation():
     return dummy_obs
 
 def make_policy(n_agents, n_features, device, num_cells, activation_class): # Shared MLP wrapper
-    return MultiAgentMLP(
+    class ForwardCompatibleMultiAgentMLP(MultiAgentMLP):
+        def forward(self, x):
+            # x is [B, A, F] during training
+            # At inference it might be [B, 1, F] (single agent), expand to match training agent count
+            if x.size(1) == 1 and self.n_agents > 1:
+                x = x.expand(-1, self.n_agents, -1)  # [B, n_agents, F]
+            return super().forward(x)
+
+    return ForwardCompatibleMultiAgentMLP(
         n_agent_inputs=n_features,
         n_agent_outputs=5,
         n_agents=n_agents,
@@ -340,7 +348,7 @@ def train_model(env, params, policies, agents_policy, critics, device):
             critic_network=critics[f"{group}_critic"],
             clip_epsilon=params["clip_epsilon"],
             entropy_coef=params["entropy_coef"],
-            normalize_advantage=False
+            normalize_advantage=True
         )
         # Set the appropriate keys
         loss_module.set_keys(
@@ -489,7 +497,7 @@ def objective(trial):
     params = {
         # Sampling parameters
         "n_parallel_envs": 8,
-        "frames_per_batch": 1000,  # Fixed for consistency
+        "frames_per_batch": 2000,  # Fixed for consistency
         "total_frames": 20000,  # Reduced for faster trials
 
         # Training parameters
@@ -502,11 +510,12 @@ def objective(trial):
         "clip_epsilon": trial.suggest_float("clip_epsilon", 0.1, 0.3),
         "gamma": trial.suggest_float("gamma", 0.99, 0.999),
         "lmbda": trial.suggest_float("lmbda", 0.95, 1.0),
-        "entropy_coef": trial.suggest_float("entropy_coef", 3e-4, 1e-3, log=True),
+        "entropy_coef": trial.suggest_float("entropy_coef", 3e-4, 1e-2, log=True),
+        "value_loss_coef": trial.suggest_float("value_loss_coef", 0.1, 1.0),
 
         # Network parameters
         "network_depth": trial.suggest_int("network_depth", 1, 3),
-        "network_width": trial.suggest_categorical("network_width", [64, 128, 256, 512, 1128]),
+        "network_width": trial.suggest_categorical("network_width", [64, 128, 256, 512]),
         "activation": trial.suggest_categorical("activation", ["Tanh", "ReLU"]),
         "share_parameters_policy": True,  # Fixed for simplicity
         "share_parameters_critic": True,  # Fixed for simplicity
@@ -531,8 +540,8 @@ def objective(trial):
 if __name__ == "__main__":
     # ---------------- Environment Wrapping ----------------
     n_parallel_envs = 8
-    frames_per_batch=5000
-    total_frames=20000
+    full_frames_per_batch=8000
+    full_total_frames=800000
     e = make_parallel_env()
     group_map = {
         "scout": ["player_0"],
@@ -563,9 +572,9 @@ if __name__ == "__main__":
     # ---------------- Hyperparameter Tuning & Training ----------------
 
     set_composite_lp_aggregate(False).set()
-    
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=1)  # Adjust based on computational resources (min. 20, n=2 is very small)
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2)
+    study = optuna.create_study(direction="maximize", pruner=pruner)
+    study.optimize(objective, n_trials=40)  # Adjust based on computational resources (min. 20, n=2 is very small)
 
     # Print best parameters
     print("Best trial:")
@@ -584,8 +593,8 @@ if __name__ == "__main__":
 
         # Sampling parameters (use full budget for final training)
         "n_parallel_envs": n_parallel_envs,
-        "frames_per_batch": frames_per_batch,
-        "total_frames": total_frames,  # Full training budget
+        "frames_per_batch": full_frames_per_batch,
+        "total_frames": full_total_frames,  # Full training budget
 
         # Other parameters from best trial
         "num_epochs": study.best_params["num_epochs"],
