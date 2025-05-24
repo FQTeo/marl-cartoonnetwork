@@ -18,7 +18,7 @@ class RLManager:
         self.n_features = 1128
         self.n_scouts = 1
         self.n_guards = 3
-        self.num_cells = 64
+        self.num_cells = 128
         self.activation_class = nn.Tanh 
         self.scout_model = self._load_model("models/scout_actor.pth", self.n_scouts, self.n_features, self.device, self.num_cells, self.activation_class)
         self.guard_model = self._load_model("models/guard_actor.pth", self.n_guards, self.n_features, self.device, self.num_cells, self.activation_class)
@@ -81,4 +81,4 @@ class RLManager:
         with torch.no_grad():
             out = model(td)
 
-        return out["action"].item()
+        return out["action"][0, 0].item()
