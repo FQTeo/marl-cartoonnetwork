@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copies your source files.
 COPY src .
+COPY models .
 
 # Starts your model server.
 CMD uvicorn rl_server:app --port 5004 --host 0.0.0.0

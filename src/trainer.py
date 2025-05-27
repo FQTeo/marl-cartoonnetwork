@@ -115,12 +115,12 @@ def make_parallel_env():
         # Positive rewards
         RewardNames.SCOUT_RECON: 1.0,         # Encourage collecting recon
         RewardNames.SCOUT_MISSION: 5.0,      # Encourage completing mission
-        RewardNames.GUARD_CAPTURES: 60.0,     # Reward for capturing
-        RewardNames.GUARD_WINS: 30.0,         # Shared win reward for all guards
+        RewardNames.GUARD_CAPTURES: 80.0,     # Reward for capturing
+        RewardNames.GUARD_WINS: 40.0,         # Shared win reward for all guards
 
         # Negative penalties
         RewardNames.SCOUT_CAPTURED: -20.0,    # Big penalty for scout getting caught
-        RewardNames.WALL_COLLISION: -1.0,     # Discourage inefficient movement
+        RewardNames.WALL_COLLISION: -0.8,     # Discourage inefficient movement
         RewardNames.AGENT_COLLIDER: -0.4,     # Discourage colliding with teammates
         RewardNames.AGENT_COLLIDEE: -0.2,     # Minor penalty if collided into
         RewardNames.STATIONARY_PENALTY: -0.3, # Discourage staying still
@@ -130,7 +130,7 @@ def make_parallel_env():
         RewardNames.SCOUT_STEP: -0.01,        # Minor penalty per scout step (urgency)
 
         # End-of-episode shaping
-        RewardNames.GUARD_TRUNCATION: -8.0,   # Penalize guards for failing to capture
+        RewardNames.GUARD_TRUNCATION: -4.0,   # Penalize guards for failing to capture
         RewardNames.SCOUT_TRUNCATION: -2.0,   # Penalize scout for not completing mission
     }
     e = raw_env(env_wrappers = [
@@ -501,20 +501,20 @@ def objective(trial):
         "total_frames": 20000,  # Reduced for faster trials
 
         # Training parameters
-        "num_epochs": trial.suggest_int("num_epochs", 3, 10),
+        "num_epochs": trial.suggest_int("num_epochs", 3, 12),
         "minibatch_size": trial.suggest_categorical("minibatch_size", [200, 400, 800]),
-        "lr": trial.suggest_float("lr", 1e-5, 1e-3, log=True),
+        "lr": trial.suggest_float("lr", 3e-5, 1e-3, log=True),
         "max_grad_norm": trial.suggest_float("max_grad_norm", 0.5, 2.0),
 
         # PPO parameters
-        "clip_epsilon": trial.suggest_float("clip_epsilon", 0.1, 0.3),
+        "clip_epsilon": trial.suggest_float("clip_epsilon", 0.2, 0.3),
         "gamma": trial.suggest_float("gamma", 0.99, 0.999),
-        "lmbda": trial.suggest_float("lmbda", 0.95, 1.0),
+        "lmbda": trial.suggest_float("lmbda", 0.95, 0.999),
         "entropy_coef": trial.suggest_float("entropy_coef", 3e-4, 1e-2, log=True),
         "value_loss_coef": trial.suggest_float("value_loss_coef", 0.1, 1.0),
 
         # Network parameters
-        "network_depth": trial.suggest_int("network_depth", 1, 3),
+        "network_depth": trial.suggest_int("network_depth", 2, 3),
         "network_width": trial.suggest_categorical("network_width", [64, 128, 256, 512]),
         "activation": trial.suggest_categorical("activation", ["Tanh", "ReLU"]),
         "share_parameters_policy": True,  # Fixed for simplicity
@@ -574,7 +574,7 @@ if __name__ == "__main__":
     set_composite_lp_aggregate(False).set()
     pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2)
     study = optuna.create_study(direction="maximize", pruner=pruner)
-    study.optimize(objective, n_trials=40)  # Adjust based on computational resources (min. 20, n=2 is very small)
+    study.optimize(objective, n_trials=50)  # Adjust based on computational resources (min. 20, n=2 is very small)
 
     # Print best parameters
     print("Best trial:")

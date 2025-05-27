@@ -1,0 +1,15 @@
+{
+  "num_epochs": 5,
+  "minibatch_size": 400,
+  "lr": 0.00016371252027401858,
+  "max_grad_norm": 1.847121884660305,
+  "clip_epsilon": 0.299177670247143,
+  "gamma": 0.9963235403595793,
+  "lmbda": 0.9543335930894435,
+  "entropy_coef": 0.0013465772802664193,
+  "value_loss_coef": 0.46929570609169735,
+  "network_depth": 2,
+  "network_width": 256,
+  "activation": "Tanh",
+  "mappo": true
+}
